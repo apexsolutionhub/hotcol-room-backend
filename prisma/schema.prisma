@@ -344,7 +344,8 @@ model Order {
   /// Selling unit price frozen at order time (not updated when Item.price changes).
   price       Float
   /// Ingredient cost per serving frozen at order time (from Item.recipeJson).
-  /// Null when the menu item had no recipe; legacy rows fall back to live recipe.
+  /// Null when the menu item had no recipe at sale — those lines have no profit.
+  /// Updating Item.recipeJson later must NOT rewrite this field on existing orders.
   unitCostAtSale Float?
   waiterName  String
   status      String?
@@ -522,6 +523,8 @@ model ItemStatus {
 }
 
 /// One named leader per department per hotel (manager-maintained).
+/// Departments: KITCHEN, BAR, HOUSE_KEEPING_*, SECURITY, MAINTENANCE, FINANCE,
+/// HR, GM, FB_SERVICE, STORE, PURCHASER.
 model DepartmentLeader {
   id         Int      @id @default(autoincrement())
   HotelName  String
@@ -650,12 +653,12 @@ model FreshBazaar {
   @@index([stockOutRequestId])
 }
 
-/// Daily chef / bar count rows (opening pulse, documented stock-out, closing on-hand).
+/// Daily kitchen / bar / room count rows (opening pulse, documented stock-out, closing on-hand).
 /// Implied movement for a day is derived when the next day’s opening is recorded: opening + stockOut − nextOpening.
 model KitchenBarBeginning {
   id          Int      @id @default(autoincrement())
   HotelName   String
-  /// CHEF | BAR
+  /// KITCHEN | BAR | ROOM (legacy CHEF normalized to KITCHEN)
   station     String
   itemName    String
   /// Opening pulse — count at the start of calendarDate (same unit as inventory).
@@ -669,6 +672,8 @@ model KitchenBarBeginning {
   stockOutDay    Float    @default(0)
   /// Units issued from station stock to management in that day.
   managementTakenDay Float @default(0)
+  /// Units issued from station stock for invitations in that day (same ONHAND treatment as management).
+  invitationTakenDay Float @default(0)
   /// Physical on-hand at end of day (lights-out snapshot).
   closingOnHand  Float    @default(0)
   notes       String   @default("")
@@ -1014,4 +1019,192 @@ model lodging_action_log {
   @@index([HotelName, createdAt])
   @@index([stayId])
   @@index([actorName])
+}
+
+// =============================================================================
+// HR MODULE (Phase 2) — employee master, leave, attendance, shifts,
+// documents, payroll, incidents. Job posting / recruiting is out of scope.
+// =============================================================================
+
+/// HR — employee master (Phase 2)
+model hr_employee {
+  id              Int       @id @default(autoincrement())
+  HotelName       String
+  fullName        String
+  phone           String    @default("")
+  email           String    @default("")
+  department      String    @default("")
+  jobTitle        String    @default("")
+  /// active | on_leave | terminated
+  status          String    @default("active")
+  hireDate        String    @default("") // YYYY-MM-DD
+  endDate         String    @default("")
+  /// hourly | monthly | tip_eligible
+  wageType        String    @default("monthly")
+  baseSalaryETB   Float     @default(0)
+  credentialUserId Int?
+  credentialUserName String @default("")
+  notes           String    @db.Text
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  leaveRequests   hr_leave_request[]
+  leaveBalances   hr_leave_balance[]
+  attendance      hr_attendance[]
+  shifts          hr_shift[]
+  documents       hr_document[]
+  payslips        hr_payslip[]
+  incidents       hr_incident[]
+
+  @@index([HotelName])
+  @@index([HotelName, status])
+  @@index([HotelName, department])
+}
+
+model hr_leave_balance {
+  id           Int    @id @default(autoincrement())
+  HotelName    String
+  employeeId   Int
+  /// annual | sick | unpaid | other
+  leaveType    String
+  balanceDays  Float  @default(0)
+  updatedAt    DateTime @updatedAt
+
+  employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, leaveType])
+  @@index([HotelName])
+}
+
+model hr_leave_request {
+  id           Int       @id @default(autoincrement())
+  HotelName    String
+  employeeId   Int
+  leaveType    String
+  fromYmd      String
+  toYmd        String
+  days         Float     @default(1)
+  reason       String    @db.Text
+  /// pending | approved | rejected | cancelled
+  status       String    @default("pending")
+  decidedBy    String    @default("")
+  decidedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([HotelName])
+  @@index([HotelName, status])
+  @@index([employeeId])
+}
+
+model hr_attendance {
+  id           Int       @id @default(autoincrement())
+  HotelName    String
+  employeeId   Int
+  workDate     String    // YYYY-MM-DD
+  clockInAt    DateTime?
+  clockOutAt   DateTime?
+  /// present | late | absent | half_day
+  status       String    @default("present")
+  notes        String    @default("")
+  createdAt    DateTime  @default(now())
+
+  employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, workDate])
+  @@index([HotelName, workDate])
+}
+
+model hr_shift {
+  id           Int      @id @default(autoincrement())
+  HotelName    String
+  employeeId   Int
+  workDate     String
+  department   String   @default("")
+  startTime    String   @default("08:00") // HH:mm
+  endTime      String   @default("17:00")
+  notes        String   @default("")
+  createdAt    DateTime @default(now())
+
+  employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([HotelName, workDate])
+  @@index([employeeId])
+}
+
+model hr_document {
+  id           Int      @id @default(autoincrement())
+  HotelName    String
+  employeeId   Int
+  title        String
+  /// contract | id | certificate | other
+  docType      String   @default("other")
+  fileUrl      String   @default("") @db.VarChar(2048)
+  notes        String   @default("")
+  createdAt    DateTime @default(now())
+
+  employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_payroll_period {
+  id           Int      @id @default(autoincrement())
+  HotelName    String
+  /// YYYY-MM
+  periodKey    String
+  fromYmd      String
+  toYmd        String
+  /// open | closed
+  status       String   @default("open")
+  notes        String   @default("")
+  closedAt     DateTime?
+  closedBy     String   @default("")
+  createdAt    DateTime @default(now())
+
+  payslips hr_payslip[]
+
+  @@unique([HotelName, periodKey])
+  @@index([HotelName])
+}
+
+model hr_payslip {
+  id              Int      @id @default(autoincrement())
+  HotelName       String
+  periodId        Int
+  employeeId      Int
+  basePayETB      Float    @default(0)
+  overtimeETB     Float    @default(0)
+  tipsETB         Float    @default(0)
+  deductionsETB   Float    @default(0)
+  netPayETB       Float    @default(0)
+  notes           String   @default("")
+  createdAt       DateTime @default(now())
+
+  period   hr_payroll_period @relation(fields: [periodId], references: [id], onDelete: Cascade)
+  employee hr_employee       @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([periodId, employeeId])
+  @@index([HotelName])
+  @@index([employeeId])
+}
+
+model hr_incident {
+  id           Int      @id @default(autoincrement())
+  HotelName    String
+  employeeId   Int
+  /// warning | complaint | commendation | other
+  kind         String   @default("warning")
+  title        String
+  detail       String   @db.Text
+  occurredYmd  String   @default("")
+  recordedBy   String   @default("")
+  createdAt    DateTime @default(now())
+
+  employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([HotelName])
+  @@index([employeeId])
 }
