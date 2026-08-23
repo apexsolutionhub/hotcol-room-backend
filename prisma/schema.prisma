@@ -48,6 +48,25 @@ model owner_property {
   @@index([tinNumber])
 }
 
+/// Field sales people who close café/hotel deals. Optional attribution on a tenant.
+model sales_agent {
+  id          Int      @id @default(autoincrement())
+  displayName String
+  phone       String?
+  email       String?
+  /// City or coverage area (e.g. Addis Ababa, Hawassa)
+  city        String?
+  notes       String?  @db.Text
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenants tenant_account[]
+
+  @@index([isActive])
+  @@index([displayName])
+}
+
 model user {
   id                          Int       @id @default(autoincrement())
   UserName                    String    @unique
@@ -168,6 +187,8 @@ model apex_team_member {
   paymentsRejected              tenant_payment_submission[]   @relation("PaymentRejectedBy")
   moduleChangesRequested        tenant_module_change_request[] @relation("ModuleChangeRequestedByApex")
   moduleChangesReviewed         tenant_module_change_request[] @relation("ModuleChangeReviewedBy")
+  orderModeChangesRequested     tenant_order_mode_change_request[] @relation("OrderModeChangeRequestedByApex")
+  orderModeChangesReviewed      tenant_order_mode_change_request[] @relation("OrderModeChangeReviewedBy")
   feedbackThreadsAssigned       tenant_feedback_thread[]      @relation("FeedbackAssignedTo")
   feedbackThreadsClosed         tenant_feedback_thread[]      @relation("FeedbackClosedBy")
 }
@@ -208,6 +229,12 @@ model tenant_account {
   hotelPhoneSecondary String @default("")
   /// Subscribed modules (canonical list for the property)
   modules          Json?
+  /// When true, cashiers may cancel unpaid live orders (Manager opt-in; default off).
+  cashierCancelOrdersEnabled Boolean @default(false)
+  /// digital | analog — café/restaurant order fulfillment
+  cafeOrderMode    String   @default("digital")
+  /// [{ mode, effectiveFrom, effectiveTo }] approved mode segments
+  cafeOrderModeHistory Json?
   /// active | suspended | banned | deleted — subscription/setup states remain on owner `user` row
   accountStatus    String   @default("active")
   suspendedAt      DateTime?
@@ -216,16 +243,21 @@ model tenant_account {
   bannedAt         DateTime?
   bannedReason     String?  @db.Text
   bannedByApexMemberId Int?
+  /// Optional field sales person who closed this property. Null = walk-in / unassigned.
+  salesAgentId     Int?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 
   suspendedBy           apex_team_member?            @relation("TenantSuspendedBy", fields: [suspendedByApexMemberId], references: [id], onDelete: SetNull)
   bannedBy              apex_team_member?            @relation("TenantBannedBy", fields: [bannedByApexMemberId], references: [id], onDelete: SetNull)
-  moduleChangeRequests  tenant_module_change_request[]
+  salesAgent            sales_agent?                 @relation(fields: [salesAgentId], references: [id], onDelete: SetNull)
+  moduleChangeRequests      tenant_module_change_request[]
+  orderModeChangeRequests   tenant_order_mode_change_request[]
 
   @@index([accountStatus])
   @@index([updatedAt])
   @@index([hotelDisplayName])
+  @@index([salesAgentId])
 }
 
 /// Tenant or Apex request to change subscribed modules (add/remove, repricing).
@@ -252,6 +284,36 @@ model tenant_module_change_request {
   tenantAccount   tenant_account    @relation(fields: [tinNumber], references: [tinNumber], onDelete: Cascade)
   requestedByApex apex_team_member? @relation("ModuleChangeRequestedByApex", fields: [requestedByApexMemberId], references: [id], onDelete: SetNull)
   reviewedByApex  apex_team_member? @relation("ModuleChangeReviewedBy", fields: [reviewedByApexMemberId], references: [id], onDelete: SetNull)
+
+  @@index([tinNumber])
+  @@index([status])
+  @@index([createdAt])
+}
+
+/// Tenant request to switch café ordering between digital screens and thermal printer.
+model tenant_order_mode_change_request {
+  id                    Int      @id @default(autoincrement())
+  tinNumber             String
+  /// digital | analog currently in use when the request was sent
+  currentMode           String
+  /// digital | analog requested
+  requestedMode         String
+  requestNote           String?  @db.Text
+  /// pending | approved | rejected | cancelled
+  status                String   @default("pending")
+  /// tenant | apex
+  requestedBySide       String
+  requestedByUserId     Int?
+  requestedByApexMemberId Int?
+  reviewedByApexMemberId  Int?
+  reviewedAt            DateTime?
+  reviewNote            String?  @db.Text
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  tenantAccount   tenant_account    @relation(fields: [tinNumber], references: [tinNumber], onDelete: Cascade)
+  requestedByApex apex_team_member? @relation("OrderModeChangeRequestedByApex", fields: [requestedByApexMemberId], references: [id], onDelete: SetNull)
+  reviewedByApex  apex_team_member? @relation("OrderModeChangeReviewedBy", fields: [reviewedByApexMemberId], references: [id], onDelete: SetNull)
 
   @@index([tinNumber])
   @@index([status])
@@ -674,6 +736,14 @@ model KitchenBarBeginning {
   managementTakenDay Float @default(0)
   /// Units issued from station stock for invitations in that day (same ONHAND treatment as management).
   invitationTakenDay Float @default(0)
+  /// Units sold / counted as sales that day. Null = legacy derive from beginning − prior on hand.
+  salesDay       Float?
+  /// Cross-check vs calculated on-hand: NEUTRAL | SHORTAGE | OVERAGE.
+  countVariance  String   @default("NEUTRAL")
+  /// Absolute units short or over when countVariance is SHORTAGE/OVERAGE.
+  countVarianceAmount Float @default(0)
+  /// When station is ROOM: KITCHEN or BAR — source station whose sales are reallocated.
+  roomSourceStation String @default("")
   /// Physical on-hand at end of day (lights-out snapshot).
   closingOnHand  Float    @default(0)
   notes       String   @default("")
@@ -696,6 +766,10 @@ model KitchenBarMonthlySnapshot {
   totalImpliedSales    Float    @default(0)
   /// closingOnHand from the last calendar day present in that month for this key.
   lastDayClosingOnHand Float    @default(0)
+  /// Sum of info-only shortage variance amounts across days in the range.
+  totalShortage        Float    @default(0)
+  /// Sum of info-only overage variance amounts across days in the range.
+  totalOverage         Float    @default(0)
   syncedAt             DateTime @default(now())
 
   @@unique([HotelName, station, itemName, monthPeriod])
@@ -1039,9 +1113,11 @@ model hr_employee {
   status          String    @default("active")
   hireDate        String    @default("") // YYYY-MM-DD
   endDate         String    @default("")
-  /// hourly | monthly | tip_eligible
+  /// monthly | weekly
   wageType        String    @default("monthly")
   baseSalaryETB   Float     @default(0)
+  bankName        String    @default("")
+  accountNumber   String    @default("")
   credentialUserId Int?
   credentialUserName String @default("")
   notes           String    @db.Text
@@ -1059,6 +1135,61 @@ model hr_employee {
   @@index([HotelName])
   @@index([HotelName, status])
   @@index([HotelName, department])
+  @@index([HotelName, credentialUserName])
+}
+
+/// HR — tenant-configured leave types (empty until HR adds them)
+model hr_leave_type {
+  id          Int      @id @default(autoincrement())
+  HotelName   String
+  code        String
+  label       String
+  paid        Boolean  @default(true)
+  defaultDays Float    @default(0)
+  active      Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([HotelName, code])
+  @@index([HotelName])
+}
+
+/// HR — tenant-configured departments for shift scheduling
+model hr_department {
+  id        Int      @id @default(autoincrement())
+  HotelName String
+  code      String
+  label     String
+  active    Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([HotelName, code])
+  @@index([HotelName])
+}
+
+/// HR — tenant-configured incident categories with optional pay impact
+model hr_incident_type {
+  id         Int      @id @default(autoincrement())
+  HotelName  String
+  code       String
+  label      String
+  deduct     Boolean  @default(false)
+  /// Percent of employee base salary applied on payslip (0–100)
+  percentOfSalary Float @default(0)
+  /// Legacy fixed ETB — prefer percentOfSalary when > 0
+  amountETB  Float    @default(0)
+  /// "" | absent | late | half_day — payroll applies percent × days of matching attendance
+  attendanceLink String @default("")
+  active     Boolean  @default(true)
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([HotelName, code])
+  @@index([HotelName])
 }
 
 model hr_leave_balance {
@@ -1105,7 +1236,7 @@ model hr_attendance {
   workDate     String    // YYYY-MM-DD
   clockInAt    DateTime?
   clockOutAt   DateTime?
-  /// present | late | absent | half_day
+  /// present | late | absent | half_day | on_leave
   status       String    @default("present")
   notes        String    @default("")
   createdAt    DateTime  @default(now())
@@ -1153,54 +1284,131 @@ model hr_document {
 model hr_payroll_period {
   id           Int      @id @default(autoincrement())
   HotelName    String
-  /// YYYY-MM
+  /// YYYY-MM of the named payslip month (most days in range; tie → earlier)
   periodKey    String
+  /// Display month name e.g. August
+  monthName    String   @default("")
   fromYmd      String
   toYmd        String
-  /// open | closed
+  /// open | awaiting_manager | approved
   status       String   @default("open")
   notes        String   @default("")
+  createdBy    String   @default("")
   closedAt     DateTime?
   closedBy     String   @default("")
   createdAt    DateTime @default(now())
 
   payslips hr_payslip[]
 
-  @@unique([HotelName, periodKey])
+  @@unique([HotelName, fromYmd, toYmd])
   @@index([HotelName])
+  @@index([HotelName, periodKey])
 }
 
 model hr_payslip {
-  id              Int      @id @default(autoincrement())
-  HotelName       String
-  periodId        Int
-  employeeId      Int
-  basePayETB      Float    @default(0)
-  overtimeETB     Float    @default(0)
-  tipsETB         Float    @default(0)
-  deductionsETB   Float    @default(0)
-  netPayETB       Float    @default(0)
-  notes           String   @default("")
-  createdAt       DateTime @default(now())
+  id                   Int       @id @default(autoincrement())
+  HotelName            String
+  periodId             Int
+  employeeId           Int
+  payslipNumber        String    @default("")
+  employeeName         String    @default("")
+  jobTitle             String    @default("")
+  taxPeriod            String    @default("")
+  organizationLocation String    @default("")
+  payDate              String    @default("")
+  hireDate             String    @default("")
+  wageType             String    @default("")
+  bankName             String    @default("")
+  accountNumber        String    @default("")
+  /// Snapshot gross (base salary)
+  basePayETB           Float     @default(0)
+  overtimeETB          Float     @default(0)
+  tipsETB              Float     @default(0)
+  /// Total deductions (legacy + computed)
+  deductionsETB        Float     @default(0)
+  netPayETB            Float     @default(0)
+  grossSalaryETB       Float     @default(0)
+  totalEarningsETB     Float     @default(0)
+  totalDeductionsETB   Float     @default(0)
+  /// JSON array [{ label, amountETB }]
+  earningsJson         String    @db.Text
+  deductionsJson       String    @db.Text
+  /// unpaid | marked_paid | approved
+  paymentStatus        String    @default("unpaid")
+  hrMarkedPaidAt       DateTime?
+  hrMarkedPaidBy       String    @default("")
+  managerApprovedAt    DateTime?
+  managerApprovedBy    String    @default("")
+  notes                String    @default("")
+  createdAt            DateTime  @default(now())
 
   period   hr_payroll_period @relation(fields: [periodId], references: [id], onDelete: Cascade)
   employee hr_employee       @relation(fields: [employeeId], references: [id], onDelete: Cascade)
 
   @@unique([periodId, employeeId])
+  @@unique([HotelName, payslipNumber])
   @@index([HotelName])
   @@index([employeeId])
+  @@index([HotelName, paymentStatus])
+}
+
+/// Manager-configured common payroll deductions / increases
+model hr_payroll_line_rule {
+  id         Int      @id @default(autoincrement())
+  HotelName  String
+  /// deduction | increase
+  kind       String
+  label      String
+  /// Percent of employee base salary (0–100). Preferred over amountETB.
+  percentOfSalary Float @default(0)
+  /// Legacy fixed ETB — used only when percentOfSalary is 0
+  amountETB  Float    @default(0)
+  /// always | day_range
+  whenMode   String   @default("always")
+  fromDay    Int?
+  toDay      Int?
+  active     Boolean  @default(true)
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([HotelName])
+  @@index([HotelName, kind])
+}
+
+/// Manager-approved pay window per wage type.
+/// fromDay = minimum inclusive From–To calendar length (days) when generating payroll.
+/// toDay kept for reference / display.
+model hr_wage_pay_window {
+  id        Int      @id @default(autoincrement())
+  HotelName String
+  wageType  String
+  fromDay   Int
+  toDay     Int
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([HotelName, wageType])
+  @@index([HotelName])
 }
 
 model hr_incident {
   id           Int      @id @default(autoincrement())
   HotelName    String
   employeeId   Int
-  /// warning | complaint | commendation | other
-  kind         String   @default("warning")
+  /// Manager-configured type code, or "other" for ad-hoc HR entries
+  kind         String   @default("other")
   title        String
   detail       String   @db.Text
   occurredYmd  String   @default("")
   recordedBy   String   @default("")
+  /// When true, pay impact is a salary deduction; when false, an increase
+  salaryDeduct Boolean  @default(false)
+  /// Percent of base salary (0–100). Preferred over amountETB when > 0.
+  percentOfSalary Float @default(0)
+  /// Legacy fixed ETB amount
+  amountETB    Float    @default(0)
   createdAt    DateTime @default(now())
 
   employee hr_employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
