@@ -41,6 +41,15 @@ export const guestTypeDefs = `
     firstName: String!
     lastName: String!
     phone: String!
+    phoneSecondary: String!
+    email: String!
+    sex: String!
+    isEthiopian: Boolean!
+    nationalId: String!
+    passportNumber: String!
+    country: String!
+    stateRegion: String!
+    addressLine: String!
   }
 
   type GuestBillLine {
@@ -72,11 +81,34 @@ export const guestTypeDefs = `
     HotelName: String!
     arrivalAt: DateTime!
     departureAt: DateTime!
+    expectedNights: Int!
+    expectedDepartureAt: DateTime
     nights: Int!
+    adults: Int!
+    children: Int!
     guest: GuestProfile!
     rooms: [GuestRoom!]!
     bill: GuestBill
     property: GuestProperty
+  }
+
+  type GuestComplaint {
+    id: Int!
+    category: String!
+    message: String!
+    status: String!
+    createdAt: DateTime!
+    updatedAt: DateTime!
+  }
+
+  type GuestRating {
+    id: Int!
+    overall: Int!
+    cleanliness: Int
+    service: Int
+    comment: String!
+    createdAt: DateTime!
+    updatedAt: DateTime!
   }
 
   type GuestSession {
@@ -127,10 +159,13 @@ export const guestTypeDefs = `
 
 export const guestQueryFields = `
   guestMe: GuestStay!
+  guestRegistrationCard: GuestStay!
   guestCafeMenu: [CafeMenuItem!]!
   guestLaundryCatalog: [LaundryCatalogItem!]!
   guestBill: GuestBill!
   guestPropertyInfo(tinNumber: String!): GuestProperty
+  guestMyComplaints: [GuestComplaint!]!
+  guestMyRating: GuestRating
 `;
 
 export const guestMutationFields = `
@@ -143,6 +178,13 @@ export const guestMutationFields = `
   ): GuestOrderResult!
   guestUpdateOrderLine(otp: String!, lineId: Int!, quantity: Float!): GuestOrderUpdateResult!
   guestCancelOrderLine(otp: String!, lineId: Int!): GuestOrderUpdateResult!
+  guestSubmitComplaint(category: String!, message: String!): GuestComplaint!
+  guestSubmitRating(
+    overall: Int!
+    cleanliness: Int
+    service: Int
+    comment: String
+  ): GuestRating!
 `;
 
 function roomNumbersFromStay(stay) {
@@ -214,6 +256,55 @@ function mapBillLine(l) {
   };
 }
 
+function mapGuestProfile(guest) {
+  return {
+    firstName: guest?.firstName || "",
+    lastName: guest?.lastName || "",
+    phone: guest?.phone || "",
+    phoneSecondary: guest?.phoneSecondary || "",
+    email: guest?.email || "",
+    sex: guest?.sex || "",
+    isEthiopian: Boolean(guest?.isEthiopian ?? true),
+    nationalId: guest?.nationalId || "",
+    passportNumber: guest?.passportNumber || "",
+    country: guest?.country || "",
+    stateRegion: guest?.stateRegion || "",
+    addressLine: guest?.addressLine || "",
+  };
+}
+
+function mapComplaint(row) {
+  return {
+    id: row.id,
+    category: row.category || "general",
+    message: row.message || "",
+    status: String(row.status || "open").toLowerCase(),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function mapRating(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    overall: Number(row.overall) || 0,
+    cleanliness: row.cleanliness == null ? null : Number(row.cleanliness),
+    service: row.service == null ? null : Number(row.service),
+    comment: row.comment || "",
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function clampRatingScore(value, label) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > 5) {
+    throw new Error(`${label} must be a whole number from 1 to 5`);
+  }
+  return n;
+}
+
 function mapStay(stay, property) {
   return {
     id: stay.id,
@@ -222,12 +313,12 @@ function mapStay(stay, property) {
     HotelName: stay.HotelName,
     arrivalAt: stay.arrivalAt,
     departureAt: stay.departureAt,
+    expectedNights: Number(stay.expectedNights) || Number(stay.nights) || 1,
+    expectedDepartureAt: stay.expectedDepartureAt || null,
     nights: stay.nights,
-    guest: {
-      firstName: stay.guest?.firstName || "",
-      lastName: stay.guest?.lastName || "",
-      phone: stay.guest?.phone || "",
-    },
+    adults: Number(stay.adults) || 1,
+    children: Number(stay.children) || 0,
+    guest: mapGuestProfile(stay.guest),
     rooms: (stay.rooms || []).map((sr) => ({
       id: sr.room?.id || sr.roomId,
       roomNumber: sr.room?.roomNumber || "",
@@ -243,6 +334,15 @@ function mapStay(stay, property) {
       : null,
     property: property || null,
   };
+}
+
+async function loadGuestStayForSession(context) {
+  const stayId = assertGuest(context);
+  const stay = await loadActiveGuestStay(context.prisma, stayId);
+  if (String(stay.HotelName) !== String(context.user.HotelName)) {
+    throw new Error("Session does not match this stay");
+  }
+  return stay;
 }
 
 async function loadActiveGuestStay(prisma, stayId) {
@@ -315,18 +415,19 @@ async function logGuestAction(prisma, stay, action, detail) {
 export const guestResolvers = {
   Query: {
     guestMe: async (_p, _a, context) => {
-      const stayId = assertGuest(context);
-      const stay = await loadActiveGuestStay(context.prisma, stayId);
-      if (String(stay.HotelName) !== String(context.user.HotelName)) {
-        throw new Error("Session does not match this stay");
-      }
+      const stay = await loadGuestStayForSession(context);
+      const property = await loadPropertyForHotel(context.prisma, stay.HotelName);
+      return mapStay(stay, property);
+    },
+
+    guestRegistrationCard: async (_p, _a, context) => {
+      const stay = await loadGuestStayForSession(context);
       const property = await loadPropertyForHotel(context.prisma, stay.HotelName);
       return mapStay(stay, property);
     },
 
     guestCafeMenu: async (_p, _a, context) => {
-      const stayId = assertGuest(context);
-      const stay = await loadActiveGuestStay(context.prisma, stayId);
+      const stay = await loadGuestStayForSession(context);
       const keys = await collectTenantHotelKeys(context.prisma, stay.HotelName);
       const items = await context.prisma.item.findMany({
         where: {
@@ -347,8 +448,7 @@ export const guestResolvers = {
     },
 
     guestLaundryCatalog: async (_p, _a, context) => {
-      const stayId = assertGuest(context);
-      const stay = await loadActiveGuestStay(context.prisma, stayId);
+      const stay = await loadGuestStayForSession(context);
       const keys = await collectTenantHotelKeys(context.prisma, stay.HotelName);
       const items = await context.prisma.lodging_service_item.findMany({
         where: {
@@ -369,8 +469,7 @@ export const guestResolvers = {
     },
 
     guestBill: async (_p, _a, context) => {
-      const stayId = assertGuest(context);
-      const stay = await loadActiveGuestStay(context.prisma, stayId);
+      const stay = await loadGuestStayForSession(context);
       if (!stay.bill) {
         return { id: 0, status: "open", totalETB: 0, lines: [] };
       }
@@ -381,6 +480,23 @@ export const guestResolvers = {
       const tin = String(tinNumber ?? "").trim();
       if (!tin) throw new Error("Property code required");
       return loadPropertyForHotel(context.prisma, tin);
+    },
+
+    guestMyComplaints: async (_p, _a, context) => {
+      const stay = await loadGuestStayForSession(context);
+      const rows = await context.prisma.lodging_guest_complaint.findMany({
+        where: { stayId: stay.id },
+        orderBy: { createdAt: "desc" },
+      });
+      return rows.map(mapComplaint);
+    },
+
+    guestMyRating: async (_p, _a, context) => {
+      const stay = await loadGuestStayForSession(context);
+      const row = await context.prisma.lodging_guest_rating.findUnique({
+        where: { stayId: stay.id },
+      });
+      return mapRating(row);
     },
   },
 
@@ -432,11 +548,7 @@ export const guestResolvers = {
     },
 
     guestVerifyOtp: async (_p, { otp }, context) => {
-      const stayId = assertGuest(context);
-      const stay = await loadActiveGuestStay(context.prisma, stayId);
-      if (String(stay.HotelName) !== String(context.user.HotelName)) {
-        throw new Error("Session does not match this stay");
-      }
+      const stay = await loadGuestStayForSession(context);
       if (!acceptsGuestOtp(otp, stay.guestOtp)) {
         throw new Error("Invalid or expired room code");
       }
@@ -444,15 +556,11 @@ export const guestResolvers = {
     },
 
     guestPlaceOrder: async (_p, { otp, foodDrink, laundry }, context) => {
-      const stayId = assertGuest(context);
       if (!isValidOtpFormat(normalizeOtp(otp))) {
         throw new Error("Enter the 6-digit room code to approve");
       }
 
-      const stay = await loadActiveGuestStay(context.prisma, stayId);
-      if (String(stay.HotelName) !== String(context.user.HotelName)) {
-        throw new Error("Session does not match this stay");
-      }
+      const stay = await loadGuestStayForSession(context);
 
       if (!acceptsGuestOtp(otp, stay.guestOtp)) {
         throw new Error("Invalid or expired room code");
@@ -590,14 +698,10 @@ export const guestResolvers = {
     },
 
     guestUpdateOrderLine: async (_p, { otp, lineId, quantity }, context) => {
-      const stayId = assertGuest(context);
       if (!isValidOtpFormat(normalizeOtp(otp))) {
         throw new Error("Enter the 6-digit room code to approve");
       }
-      const stay = await loadActiveGuestStay(context.prisma, stayId);
-      if (String(stay.HotelName) !== String(context.user.HotelName)) {
-        throw new Error("Session does not match this stay");
-      }
+      const stay = await loadGuestStayForSession(context);
       if (!acceptsGuestOtp(otp, stay.guestOtp)) {
         throw new Error("Invalid or expired room code");
       }
@@ -690,14 +794,10 @@ export const guestResolvers = {
     },
 
     guestCancelOrderLine: async (_p, { otp, lineId }, context) => {
-      const stayId = assertGuest(context);
       if (!isValidOtpFormat(normalizeOtp(otp))) {
         throw new Error("Enter the 6-digit room code to approve");
       }
-      const stay = await loadActiveGuestStay(context.prisma, stayId);
-      if (String(stay.HotelName) !== String(context.user.HotelName)) {
-        throw new Error("Session does not match this stay");
-      }
+      const stay = await loadGuestStayForSession(context);
       if (!acceptsGuestOtp(otp, stay.guestOtp)) {
         throw new Error("Invalid or expired room code");
       }
@@ -778,6 +878,81 @@ export const guestResolvers = {
         stay: mapStay(refreshed, property),
         line: mapBillLine(updated),
       };
+    },
+
+    guestSubmitComplaint: async (_p, { category, message }, context) => {
+      const stay = await loadGuestStayForSession(context);
+      const cat = String(category ?? "").trim() || "general";
+      const msg = String(message ?? "").trim();
+      if (!msg) throw new Error("Please describe your complaint");
+      if (msg.length > 4000) {
+        throw new Error("Complaint message is too long");
+      }
+      if (cat.length > 80) throw new Error("Category is too long");
+
+      const row = await context.prisma.lodging_guest_complaint.create({
+        data: {
+          HotelName: stay.HotelName,
+          stayId: stay.id,
+          guestId: stay.guestId,
+          category: cat,
+          message: msg,
+          status: "open",
+        },
+      });
+
+      await logGuestAction(context.prisma, stay, "guest_submit_complaint", {
+        complaintId: row.id,
+        category: cat,
+      });
+
+      return mapComplaint(row);
+    },
+
+    guestSubmitRating: async (
+      _p,
+      { overall, cleanliness, service, comment },
+      context,
+    ) => {
+      const stay = await loadGuestStayForSession(context);
+      const overallScore = clampRatingScore(overall, "Overall rating");
+      const cleanlinessScore =
+        cleanliness == null || cleanliness === ""
+          ? null
+          : clampRatingScore(cleanliness, "Cleanliness rating");
+      const serviceScore =
+        service == null || service === ""
+          ? null
+          : clampRatingScore(service, "Service rating");
+      const note = String(comment ?? "").trim();
+      if (note.length > 2000) throw new Error("Comment is too long");
+
+      const row = await context.prisma.lodging_guest_rating.upsert({
+        where: { stayId: stay.id },
+        create: {
+          HotelName: stay.HotelName,
+          stayId: stay.id,
+          guestId: stay.guestId,
+          overall: overallScore,
+          cleanliness: cleanlinessScore,
+          service: serviceScore,
+          comment: note,
+        },
+        update: {
+          overall: overallScore,
+          cleanliness: cleanlinessScore,
+          service: serviceScore,
+          comment: note,
+          guestId: stay.guestId,
+        },
+      });
+
+      await logGuestAction(context.prisma, stay, "guest_submit_rating", {
+        ratingId: row.id,
+        overall: overallScore,
+      });
+
+      return mapRating(row);
     },
   },
 };
