@@ -97,6 +97,8 @@ export const guestTypeDefs = `
     category: String!
     message: String!
     status: String!
+    roomNumber: String!
+    stayId: Int!
     createdAt: DateTime!
     updatedAt: DateTime!
   }
@@ -107,6 +109,8 @@ export const guestTypeDefs = `
     cleanliness: Int
     service: Int
     comment: String!
+    stayId: Int!
+    voucherCode: String!
     createdAt: DateTime!
     updatedAt: DateTime!
   }
@@ -166,6 +170,7 @@ export const guestQueryFields = `
   guestPropertyInfo(tinNumber: String!): GuestProperty
   guestMyComplaints: [GuestComplaint!]!
   guestMyRating: GuestRating
+  guestMyRatings: [GuestRating!]!
 `;
 
 export const guestMutationFields = `
@@ -279,12 +284,14 @@ function mapComplaint(row) {
     category: row.category || "general",
     message: row.message || "",
     status: String(row.status || "open").toLowerCase(),
+    roomNumber: String(row.roomNumber || "").trim(),
+    stayId: Number(row.stayId) || 0,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
 }
 
-function mapRating(row) {
+function mapRating(row, stayMeta = null) {
   if (!row) return null;
   return {
     id: row.id,
@@ -292,6 +299,8 @@ function mapRating(row) {
     cleanliness: row.cleanliness == null ? null : Number(row.cleanliness),
     service: row.service == null ? null : Number(row.service),
     comment: row.comment || "",
+    stayId: Number(row.stayId) || 0,
+    voucherCode: String(stayMeta?.voucherCode || row.stay?.voucherCode || ""),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -484,8 +493,12 @@ export const guestResolvers = {
 
     guestMyComplaints: async (_p, _a, context) => {
       const stay = await loadGuestStayForSession(context);
+      const where =
+        stay.guestId != null
+          ? { HotelName: stay.HotelName, guestId: stay.guestId }
+          : { stayId: stay.id };
       const rows = await context.prisma.lodging_guest_complaint.findMany({
-        where: { stayId: stay.id },
+        where,
         orderBy: { createdAt: "desc" },
       });
       return rows.map(mapComplaint);
@@ -496,7 +509,21 @@ export const guestResolvers = {
       const row = await context.prisma.lodging_guest_rating.findUnique({
         where: { stayId: stay.id },
       });
-      return mapRating(row);
+      return mapRating(row, stay);
+    },
+
+    guestMyRatings: async (_p, _a, context) => {
+      const stay = await loadGuestStayForSession(context);
+      const where =
+        stay.guestId != null
+          ? { HotelName: stay.HotelName, guestId: stay.guestId }
+          : { stayId: stay.id };
+      const rows = await context.prisma.lodging_guest_rating.findMany({
+        where,
+        include: { stay: { select: { voucherCode: true } } },
+        orderBy: { createdAt: "desc" },
+      });
+      return rows.map((r) => mapRating(r, r.stay));
     },
   },
 
@@ -890,11 +917,14 @@ export const guestResolvers = {
       }
       if (cat.length > 80) throw new Error("Category is too long");
 
+      const rooms = roomNumbersFromStay(stay);
+      const primaryRoom = rooms.split(",")[0]?.trim() || "";
       const row = await context.prisma.lodging_guest_complaint.create({
         data: {
           HotelName: stay.HotelName,
           stayId: stay.id,
           guestId: stay.guestId,
+          roomNumber: primaryRoom,
           category: cat,
           message: msg,
           status: "open",
@@ -904,6 +934,7 @@ export const guestResolvers = {
       await logGuestAction(context.prisma, stay, "guest_submit_complaint", {
         complaintId: row.id,
         category: cat,
+        roomNumber: primaryRoom,
       });
 
       return mapComplaint(row);
@@ -952,7 +983,7 @@ export const guestResolvers = {
         overall: overallScore,
       });
 
-      return mapRating(row);
+      return mapRating(row, stay);
     },
   },
 };
