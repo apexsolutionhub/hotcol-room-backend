@@ -231,6 +231,8 @@ model tenant_account {
   modules          Json?
   /// When true, cashiers may cancel unpaid live orders (Manager opt-in; default off).
   cashierCancelOrdersEnabled Boolean @default(false)
+  /// Manager/Admin opt-in: Reception may use the Cleaning & Maintenance portal.
+  receptionCmPortalEnabled Boolean @default(false)
   /// Apex opt-in: Café and Restaurant properties may use HotCol Waiter ordering.
   waiterOrderingEnabled Boolean @default(false)
   /// Manager/Admin opt-in: waiters may send payment-approval requests to cashiers.
